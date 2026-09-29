@@ -66,6 +66,13 @@ def _load_hma_methods(names):
         if getattr(n, "name", None)
         in ("_v41_whole_page_sizes", "_ascend_v41_whole_page_sizes")
     ]
+    base_tree = ast.parse(UCM_PATH.read_text(encoding="utf-8-sig"))
+    base = next(
+        n for n in base_tree.body if getattr(n, "name", None) == "UCMDirectConnector"
+    )
+    nodes.extend(
+        n for n in base.body if getattr(n, "name", None) == "_get_mla_dump_slice"
+    )
     module = ast.Module(body=helpers + nodes, type_ignores=[])
     ast.fix_missing_locations(module)
 
@@ -1301,14 +1308,15 @@ class UCMV41CompatibilityTest(unittest.TestCase):
                     tp_dump_tasks={},
                     file_size={"FA": 4096, "WA": 0},
                 )
+                connector._get_mla_dump_slice = types.MethodType(
+                    methods["_get_mla_dump_slice"], connector
+                )
                 self.assertIsNone(methods["_create_wa_store"](connector, None))
                 self.assertEqual(
                     methods["_lookup_external_hit_blocks"](connector, keys), 8
                 )
                 methods["wait_for_save"](connector)
-                start = len(keys) * rank // tp_size
-                end = len(keys) * (rank + 1) // tp_size
-                self.assertEqual(saved, [("FA", keys[start:end])])
+                self.assertEqual(saved, [("FA", keys[rank::tp_size])])
 
     def test_replay_chunks_do_not_dump_past_the_scheduler_computed_position(self):
         methods = _load_hma_methods(

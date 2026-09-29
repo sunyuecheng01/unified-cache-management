@@ -1494,6 +1494,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         dump_ucm_block_ids: list[bytes] = []
         dump_vllm_block_ids: list[int] = []
         dump_group_ids: list[int] = []
+        dump_block_start = 0
 
         external_hit_lcm_blocks = (
             req_meta.total_hit_block_num - req_meta.hbm_hit_block_num
@@ -1555,14 +1556,14 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 end_blk = dump_tok_end // group.block_size
                 if start_blk >= end_blk:
                     continue
-                extend_non_null(
-                    dump_ucm_block_ids,
-                    dump_vllm_block_ids,
-                    dump_group_ids,
-                    req_meta.group_ucm_block_ids[gid][start_blk:end_blk],
-                    req_meta.group_vllm_block_ids[gid][start_blk:end_blk],
-                    gid,
-                )
+                if self.is_mla and not dump_ucm_block_ids:
+                    # Use the first FA group's start to stripe the combined list.
+                    dump_block_start = start_blk
+                group_keys = req_meta.group_ucm_block_ids[gid][start_blk:end_blk]
+                group_blocks = req_meta.group_vllm_block_ids[gid][start_blk:end_blk]
+                dump_ucm_block_ids.extend(group_keys)
+                dump_vllm_block_ids.extend(group_blocks)
+                dump_group_ids.extend([gid] * len(group_keys))
             dump_full_attn_count = len(dump_ucm_block_ids) if self.is_mla else 0
             # Pass 2: mamba state blocks
             for gid, group in enumerate(groups_by_id):
@@ -1592,6 +1593,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             dump_full_attn_count=dump_full_attn_count,
             load_group_ids=load_group_ids,
             dump_group_ids=dump_group_ids,
+            dump_block_start=dump_block_start,
         )
 
     def build_connector_meta(
@@ -1670,7 +1672,9 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             scheduler_output.preempted_req_ids or set(),
         )
 
-    def _scope_blocks(self, ucm_ids, vllm_ids, group_ids, full_attn_count, is_dump):
+    def _scope_blocks(
+        self, ucm_ids, vllm_ids, group_ids, full_attn_count, is_dump, dump_block_start=0
+    ):
         """Rank-scope block IDs for dump or load.
 
         Returns rank-0 hashes, scoped store keys, matching vLLM block IDs,
@@ -1690,8 +1694,11 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
             kda_scoped = kda_ucm
         else:
             kda_scoped = [self.request_hasher(b) for b in kda_ucm]
-        if is_dump and not is_rank0:
-            return kda_ucm, kda_scoped, kda_vllm, kda_groups
+        if is_dump:
+            key_slice = self._get_mla_dump_slice(dump_block_start)
+            mla_ucm = mla_ucm[key_slice]
+            mla_vllm = mla_vllm[key_slice]
+            mla_groups = mla_groups[key_slice]
         return (
             mla_ucm + kda_ucm,
             mla_ucm + kda_scoped,
@@ -1816,6 +1823,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
                 getattr(request, "dump_group_ids", []),
                 n,
                 is_dump=True,
+                dump_block_start=request.dump_block_start,
             )
             if not scoped_ucm:
                 continue

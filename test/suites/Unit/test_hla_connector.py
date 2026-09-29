@@ -140,6 +140,21 @@ def hla():
     for node in base_nodes:
         if node.name == "UCMConnectorMetadata":
             node.bases = []
+    # Include the inherited production selector in the AST-isolated connector.
+    base_tree = ast.parse(connector_path.read_text(encoding="utf-8-sig"))
+    selector = next(
+        method
+        for cls in base_tree.body
+        if isinstance(cls, ast.ClassDef) and cls.name == "UCMDirectConnector"
+        for method in cls.body
+        if getattr(method, "name", None) == "_get_mla_dump_slice"
+    )
+    for node in nodes:
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.name == "UCMHybridLinearAttentionConnector"
+        ):
+            node.body.append(selector)
     nodes = base_nodes + nodes
     namespace = {
         "__name__": __name__,
