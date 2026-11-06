@@ -172,6 +172,24 @@ TEST(Cache2CtrlStrategyTest, SchedulerWithoutShardSizeStartsAfterWorker)
     EXPECT_EQ(observed.Value().handle.load(std::memory_order_relaxed), 123);
 }
 
+TEST(Cache2CtrlStrategyTest, StageWorkersShareControlWithoutSchedulerObserver)
+{
+    auto cfg = MakeControlConfig(ControlTestId("pp_no_observer"), 6);
+    cfg.localRankSize = 2;
+    cfg.observerCount = 0;
+    CtrlStrategy first;
+    CtrlStrategy second;
+    ASSERT_TRUE(first.Setup(cfg).Success());
+    cfg.deviceId = 7;
+    ASSERT_TRUE(second.Setup(cfg).Success());
+    CtrlLayout::RankDataDesc desc;
+    desc.handle.store(456, std::memory_order_relaxed);
+    ASSERT_TRUE(first.Layout().SetRankDesc(0, desc).Success());
+    auto observed = second.Layout().GetRankDesc(0);
+    ASSERT_TRUE(observed);
+    EXPECT_EQ(observed.Value().handle.load(std::memory_order_relaxed), 456);
+}
+
 TEST(Cache2CtrlStrategyTest, SchedulerStillRejectsMismatchedCapacityAndRanks)
 {
     auto id = ControlTestId("scheduler_mismatch");

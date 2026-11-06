@@ -46,6 +46,26 @@ TEST(UCCache2CopyConfigTest, DefaultsFollowRuntime)
     EXPECT_FALSE(config.ioAggregation);
     EXPECT_EQ(config.sdmaDirect, bool(UCM_RUNTIME_ASCEND_SDMA_DIRECT));
     EXPECT_TRUE(config.Validate().Success());
+    EXPECT_EQ(config.cacheRank, -1);
+    EXPECT_EQ(config.observerCount, 1);
+}
+
+TEST(UCCache2CopyConfigTest, StageRankIsIndependentOfDeviceOrdinal)
+{
+    auto dict = MakeWorkerConfig();
+    dict.SetNumber("device_id", 7);
+    dict.SetNumber("local_rank_size", 2);
+    dict.SetNumber("cache_rank", 0);
+    dict.SetNumber("cache_observer_count", 0);
+    auto config = UC::Cache2::Config::From(dict);
+    EXPECT_TRUE(config.Validate().Success());
+    EXPECT_EQ(config.deviceId, 7);
+    EXPECT_EQ(config.cacheRank, 0);
+    EXPECT_EQ(config.observerCount, 0);
+    config.cacheRank = 2;
+    EXPECT_TRUE(config.Validate().Failure());
+    config.cacheRank = -2;
+    EXPECT_TRUE(config.Validate().Failure());
 }
 
 TEST(UCCache2CopyConfigTest, HmaFaAggregationDefaultRespectsRuntime)

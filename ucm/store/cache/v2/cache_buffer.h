@@ -133,6 +133,10 @@ public:
         if (cfg.localRankSize == 0 || cfg.localRankSize > kMaxRanks) {
             return Status::InvalidParam("invalid cache2 local rank size({})", cfg.localRankSize);
         }
+        if (cfg.cacheRank < -1 ||
+            (cfg.cacheRank >= 0 && static_cast<size_t>(cfg.cacheRank) >= cfg.localRankSize)) {
+            return Status::InvalidParam("invalid cache2 rank({})", cfg.cacheRank);
+        }
         if (cfg.loadExclusiveBufferNumber % cfg.localRankSize != 0) {
             return Status::InvalidParam(
                 "cache2 load exclusive buffer number({}) must be divisible by ranks({})",
@@ -154,9 +158,8 @@ public:
                 "cache2 reserved slots per rank({}) must be less than slots per rank({})",
                 reservedSlots_, slotsPerRank_);
         }
-        /* Cache2 currently identifies the worker-local partition by deviceId. */
-        myRank_ = static_cast<size_t>(cfg.deviceId);
-        myRank_ = myRank_ % rankCount_;
+        myRank_ = cfg.cacheRank >= 0 ? static_cast<size_t>(cfg.cacheRank)
+                                    : static_cast<size_t>(cfg.deviceId) % rankCount_;
         layout.InitSlotRange(myRank_);
         DataOptions dataOptions;
         dataOptions.domainId = cfg.uniqueId;

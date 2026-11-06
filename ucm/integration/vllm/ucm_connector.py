@@ -4,6 +4,7 @@ import math
 import os
 import re
 import shutil
+import socket
 import time
 import uuid
 from collections import defaultdict
@@ -28,7 +29,7 @@ try:
 except ImportError:
     KVConnectorWorkerMetadata = object
 
-from vllm.distributed.parallel_state import get_world_group
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group, get_world_group
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -50,6 +51,13 @@ from ucm.integration.vllm.metrics import (
     UCM_HAS_PROM_METRICS,
     UCMConnectorStats,
     UCMPromMetrics,
+)
+from ucm.integration.vllm.pp_stage import (
+    StageQueryStore,
+    StageWorkerStore,
+    stage_disk_capacity,
+    stage_paths,
+    validate_manifest,
 )
 from ucm.integration.vllm.rank_consistency import RankConsistencyManager
 from ucm.integration.vllm.request_hasher import RequestHasher
@@ -459,6 +467,7 @@ class KVCacheLayout:
         self.tensor_size_lists: np.ndarray
         self.block_stride_lists: np.ndarray
         self.use_layerwise = ucm_config.get("use_layerwise", True)
+        self.stage_local = ucm_config.get("_pp_stage_local", False)
         self.kv_cache_config = kv_cache_config
         self.vllm_config = vllm_config
         self.pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
@@ -531,8 +540,17 @@ class KVCacheLayout:
         tensor_rows = [[] for _ in range(num_rows)]
         row_layer_ids = [None for _ in range(num_rows)]
 
-        for layer_name, kv_layer in kvcaches.items():
-            local_layer_id = self.layer_name_to_id[layer_name] - self.first_layer_id
+        dense_rows = {
+            layer: row
+            for row, layer in enumerate(sorted(set(self.layer_name_to_id.values())))
+        }
+        entries = sorted(kvcaches.items()) if self.stage_local else kvcaches.items()
+        for layer_name, kv_layer in entries:
+            local_layer_id = (
+                dense_rows[self.layer_name_to_id[layer_name]]
+                if self.stage_local
+                else self.layer_name_to_id[layer_name] - self.first_layer_id
+            )
             row_layer_ids[local_layer_id] = self.layer_name_to_id[layer_name]
             tensor_rows[local_layer_id].extend(self._tensor_infos(layer_name, kv_layer))
 
@@ -708,7 +726,7 @@ class KVCacheLayout:
 
     @property
     def block_size(self) -> int:
-        if self.pp_size > 1:
+        if self.pp_size > 1 and not self.stage_local:
             num_layers = self.num_hidden_layers + self._num_mtp_layers()
             return int(self.tensor_size_lists[0].sum()) * num_layers
         return int(self.tensor_size_lists.sum())
@@ -1107,6 +1125,14 @@ class SharedIndexerKVCacheLayout(KVCacheLayout):
             )
 
         indexer_layers = [layer for layer in layers if layer.indexer is not None]
+        if not indexer_layers and self.stage_local:
+            self._set_segment_rows(
+                [
+                    [self._whole_tensor_segment(t) for t in layer.sfa_tensors]
+                    for layer in layers
+                ]
+            )
+            return
         if not indexer_layers:
             raise ValueError(
                 "CUDA Shared Indexer KV cache layout did not find any "
@@ -1209,6 +1235,14 @@ class SharedIndexerKVCacheLayout(KVCacheLayout):
             layout_mode = "li_c8"
         elif bf16_layers:
             layout_mode = "bf16"
+        elif self.stage_local:
+            self._set_segment_rows(
+                [
+                    [self._whole_tensor_segment(t) for t in layer.sfa_tensors]
+                    for layer in layers
+                ]
+            )
+            return
         else:
             raise ValueError(
                 "Shared Indexer KV cache layout did not find any full " "Indexer layer."
@@ -1670,7 +1704,14 @@ class UCMDirectConnector(KVConnectorBase_V1):
             .get("ucm_connector_config", {})
             .get("share_buffer_enable", self.is_mla)
         )
-        if share_buffer_enable and not uses_partitioned_cache():
+        if (
+            share_buffer_enable
+            and not uses_partitioned_cache()
+            and not (
+                getattr(self, "_pp_stage_enabled", False)
+                and role == KVConnectorRole.SCHEDULER
+            )
+        ):
             if role == KVConnectorRole.WORKER:
                 self.unique_id = _worker_generate_unique_id()
             else:
@@ -1861,6 +1902,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
         kv_cache_layout: Optional[KVCacheLayout],
         cpu_affinity_cores: Optional[list[int]] = None,
     ) -> UcmKVStoreBaseV1:
+        if getattr(self, "_pp_stage_enabled", False):
+            self._prepare_pp_layout(kv_cache_layout)
         if len(self.connector_configs) != 1:
             raise RuntimeError(
                 f"Expected exactly one connector config, "
@@ -1899,7 +1942,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 store_shard_size,
                 store_block_size,
             )
-            self._publish_block_size(gc_block_size)
+            if not getattr(self, "_pp_stage_enabled", False):
+                self._publish_block_size(gc_block_size)
             if store_shard_size != logical_shard_size:
                 logger.info(
                     "Pad Store sizes for I/O alignment: "
@@ -1943,8 +1987,15 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 logger.warning(f"Falling back to manual block_size estimate: {bs}")
             config["block_size"] = bs
         config["posix_gc_enable"] = self._gc_owner
+        if getattr(self, "_pp_stage_enabled", False):
+            self._configure_pp_store(config)
         logger.info(f"create {name} with config: {config}")
-        return UcmConnectorFactoryV1.create_connector(name, config, module_path)
+        store = UcmConnectorFactoryV1.create_connector(name, config, module_path)
+        if getattr(self, "_pp_stage_enabled", False):
+            return StageWorkerStore(
+                store, self._pp_signature, self._pp_rank, self.layer_ids
+            )
+        return store
 
     @property
     def _dp_rank(self) -> int:
@@ -2849,7 +2900,27 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         role: KVConnectorRole,
         kv_cache_config: Optional["KVCacheConfig"] = None,
     ):
+        self._pp_stage_enabled = (
+            # UCMCPConnector场景下不生效
+            type(self) is UCMLayerWiseConnector
+            and vllm_config.parallel_config.pipeline_parallel_size > 1
+        )
+        if self._pp_stage_enabled:
+            self._defer_scheduler_store = True
         super().__init__(vllm_config, role, kv_cache_config)
+        if self._pp_stage_enabled:
+            self.launch_config["_pp_stage_local"] = True
+            config = self.connector_configs[0].get("ucm_connector_config", {})
+            if (
+                len(self.connector_configs) != 1
+                or self.connector_configs[0]["ucm_connector_name"] != "UcmPipelineStore"
+                or config.get("store_pipeline") != "Cache|Posix"
+                or not config.get("storage_backends")
+            ):
+                raise ValueError(
+                    "Stage-local PP requires UcmPipelineStore with Cache|Posix "
+                    "and shared storage_backends on every node"
+                )
         # {layer_id: {request_id: Task}}
         self.load_tasks: dict[int, dict[str, Task]] = defaultdict(dict)
         self.use_layerwise = True
@@ -2866,6 +2937,154 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self._layerwise_load_bytes = 0
         self._layerwise_save_bytes = 0
         logger.info("Init UCMLayerWiseConnector.")
+
+    def _prepare_pp_layout(self, layout):
+        """Exchange actual registered geometry before creating any Cache domain."""
+        self._pp_rank = get_pp_group().rank_in_group
+        tp_rank = get_tp_group().rank_in_group
+        shard_size, block_size = _get_store_io_sizes(
+            layout.shard_size * self.blocks_per_chunk,
+            layout.block_size * self.blocks_per_chunk,
+        )
+        schema = []
+        for name, value in sorted(self.kv_caches.items()):
+            tensors = value if isinstance(value, (tuple, list)) else [value]
+            schema.append(
+                (
+                    name,
+                    [
+                        (
+                            str(t.dtype),
+                            list(
+                                t.shape[2:]
+                                if t.dim() == 5 and t.shape[0] == 2
+                                else t.shape[1:]
+                            ),
+                        )
+                        for t in tensors
+                    ],
+                )
+            )
+        descriptor = {
+            "pp_rank": self._pp_rank,
+            "tp_rank": tp_rank,
+            "host": socket.gethostname(),
+            "layout": {
+                "layer_ids": self.layer_ids,
+                "tensor_sizes": layout.tensor_size_lists.tolist(),
+                "present": (layout.base_ptrs != 0).tolist(),
+                "schema": schema,
+                "shard_size": shard_size,
+                "block_size": block_size,
+                "token_block_size": self.block_size,
+            },
+        }
+        # TP then PP collectives stay inside one DP engine. The global world
+        # group may contain other DP engines with duplicate (PP, TP) ranks.
+        tp_descriptors = [None] * self.tp_size
+        torch.distributed.all_gather_object(
+            tp_descriptors, descriptor, group=get_tp_group().cpu_group
+        )
+        stage_descriptors = [None] * get_pp_group().world_size
+        torch.distributed.all_gather_object(
+            stage_descriptors, tp_descriptors, group=get_pp_group().cpu_group
+        )
+        descriptors = [d for stage in stage_descriptors for d in stage]
+        self._pp_manifest, self._pp_signature = validate_manifest(
+            descriptors,
+            self._vllm_config.parallel_config.pipeline_parallel_size,
+            self.tp_size,
+        )
+        self._pp_descriptor = descriptor
+        self._pp_descriptors = descriptors
+        self._pp_layer_rows = {layer: row for row, layer in enumerate(self.layer_ids)}
+        logger.info(
+            "UCM PP stage=%s layout=%s layers=%s shard_size=%s block_size=%s",
+            self._pp_rank,
+            self._pp_signature,
+            self.layer_ids,
+            shard_size,
+            block_size,
+        )
+
+    def _configure_pp_store(self, config):
+        descriptor = self._pp_descriptor
+        on_node = [d for d in self._pp_descriptors if d["host"] == descriptor["host"]]
+        peers = sorted(d["tp_rank"] for d in on_node if d["pp_rank"] == self._pp_rank)
+        config["storage_backends"] = stage_paths(
+            config["storage_backends"], self._pp_rank
+        )
+        config["unique_id"] = (
+            f"{self.unique_id}_pp{self._pp_rank}_{self._pp_signature[:16]}"
+        )
+        config["local_rank_size"] = len(peers)
+        config["cache_rank"] = peers.index(descriptor["tp_rank"])
+        config["cache_observer_count"] = 0
+        if uses_partitioned_cache():
+            config.setdefault(
+                "cache_load_exclusive_buffer_number",
+                math.ceil(1024 / len(peers)) * len(peers),
+            )
+        if "posix_capacity_gb" in config:
+            config["posix_capacity_gb"] = stage_disk_capacity(
+                config["posix_capacity_gb"], self._pp_manifest, self._pp_rank
+            )
+        # The original capacity helper already divides private legacy stores
+        # among all local workers. Shared domains now need one budget per stage.
+        if "Cache" in config["store_pipeline"] and (
+            uses_partitioned_cache() or config.get("share_buffer_enable", False)
+        ):
+            domains = len({d["pp_rank"] for d in on_node})
+            capacity = int(config["cache_buffer_capacity_gb"]) // domains
+            if capacity < 1:
+                raise ValueError("Cache capacity is too small for local PP stages")
+            config["cache_buffer_capacity_gb"] = capacity
+
+    def get_handshake_metadata(self):
+        if self._pp_stage_enabled:
+            return self._pp_descriptor
+        return None
+
+    def set_xfer_handshake_metadata_pp_aware(self, metadata):
+        if not self._pp_stage_enabled:
+            return
+        for rank, descriptor in metadata.items():
+            if rank != (descriptor["pp_rank"], descriptor["tp_rank"]):
+                raise ValueError(
+                    "PP handshake rank does not match its layout descriptor"
+                )
+        manifest, signature = validate_manifest(
+            list(metadata.values()),
+            self._vllm_config.parallel_config.pipeline_parallel_size,
+            self.tp_size,
+        )
+        stores = []
+        for pp, layout in enumerate(manifest["stages"]):
+            config = copy.deepcopy(self.connector_configs[0]["ucm_connector_config"])
+            if "posix_capacity_gb" in config:
+                config["posix_capacity_gb"] = stage_disk_capacity(
+                    config["posix_capacity_gb"], manifest, pp
+                )
+            config.update(
+                store_pipeline="Posix",
+                device_id=-1,
+                block_size=layout["block_size"],
+                shard_size=layout["shard_size"],
+                posix_gc_enable=self._gc_owner,
+                storage_backends=stage_paths(config["storage_backends"], pp),
+            )
+            stores.append(
+                UcmConnectorFactoryV1.create_connector("UcmPipelineStore", config)
+            )
+        self.store = StageQueryStore(stores, signature, self._other_rank_hashers)
+        logger.info(
+            "UCM PP committed lookup ready: stages=%s layout=%s", len(stores), signature
+        )
+
+    def _prefetch_all_rank_hashes(self, rank0_block_ids):
+        if not self._pp_stage_enabled:
+            return super()._prefetch_all_rank_hashes(rank0_block_ids)
+        # StageQueryStore is committed-only; worker Cache handles the load.
 
     def _record_layerwise_load_duration(self, layer_id: int, load_end: float) -> bool:
         if layer_id not in self._layerwise_load_start_by_layer:
@@ -2894,7 +3113,11 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             )
             for request_id in dump_request_ids
         }
-        local_layer_id = layer_id - self.first_layer_id
+        local_layer_id = (
+            self._pp_layer_rows[layer_id]
+            if getattr(self, "_pp_stage_enabled", False)
+            else layer_id - self.first_layer_id
+        )
         if self.dump_total_ptrs is None:
             self.dump_total_ptrs = self.kv_cache_layout.extract_block_addrs(
                 total_vllm_block_ids, layer_first=True
@@ -3066,8 +3289,17 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 
         next_layer_id = current_layer_id + 1
         has_next = next_layer_id in self.layer_ids
+        if getattr(self, "_pp_stage_enabled", False):
+            next_row = self._pp_layer_rows[current_layer_id] + 1
+            has_next = next_row < len(self.layer_ids)
+            if has_next:
+                next_layer_id = self.layer_ids[next_row]
         if has_next:
-            next_local_row = next_layer_id - self.first_layer_id
+            next_local_row = (
+                self._pp_layer_rows[next_layer_id]
+                if getattr(self, "_pp_stage_enabled", False)
+                else next_layer_id - self.first_layer_id
+            )
             self._submit_request_load_tasks_for_layer(
                 next_layer_id, next_local_row, metadata
             )
@@ -4025,8 +4257,15 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         """
         return self.connector.get_block_ids_with_load_errors()
 
+    def get_handshake_metadata(self):
+        if getattr(self.connector, "_pp_stage_enabled", False):
+            return self.connector.get_handshake_metadata()
+        return None
+
     @_record_connector_interface_duration
     def set_xfer_handshake_metadata_pp_aware(self, metadata) -> None:
+        if getattr(self.connector, "_pp_stage_enabled", False):
+            return self.connector.set_xfer_handshake_metadata_pp_aware(metadata)
         logger.info(
             "UCMConnector ignores PP-disaggregated handshake metadata: %s",
             list(metadata.keys()),

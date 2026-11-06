@@ -166,7 +166,7 @@ private:
         const auto nShard = task->desc.size();
         std::vector<size_t> indexes(nShard);
         if (task->desc.distributeBackendLoad) {
-            indexes = RearrangeIndex(nShard, deviceId_, localRankSize_);
+            indexes = RearrangeIndex(nShard, buffer_->MyRank(), localRankSize_);
         } else {
             std::iota(indexes.begin(), indexes.end(), 0);
         }

@@ -112,8 +112,10 @@ private:
                      lockCount);
         layout_.InitHeader(dims.slotSize);
         layout_.MarkReady();
-        acceptThread_ =
-            std::thread([this, joinerCount = dims.rankCount] { AcceptLoop(joinerCount); });
+        acceptThread_ = std::thread(
+            [this, joinerCount = dims.rankCount + cfg.observerCount - 1] {
+                AcceptLoop(joinerCount);
+            });
         return Status::OK();
     }
 

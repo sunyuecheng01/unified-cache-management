@@ -77,6 +77,9 @@ struct Config {
     /* Keeps the cc core's single-stream aggregation instead of rotating copies. */
     bool ioAggregation{false};
     size_t localRankSize{8};
+    // Dense worker index inside this node's Cache domain; independent of device ordinal.
+    int32_t cacheRank{-1};
+    size_t observerCount{1};
     /* Connector-derived hints, never user configuration. deviceNumaNode is the
      * accelerator's real NUMA affinity, absent when topology does not expose
      * one; fallbackNumaRank and fallbackNumaRankCount describe this worker's
@@ -129,6 +132,8 @@ struct Config {
         // Match cc: HMA's FA default must not enable an unsupported copy path.
         config.ioAggregation = config.ioAggregation && UCM_RUNTIME_ASCEND_IO_AGGREGATION;
         dict.GetNumber("local_rank_size", config.localRankSize);
+        dict.GetNumber("cache_rank", config.cacheRank);
+        dict.GetNumber("cache_observer_count", config.observerCount);
         if (dict.Contains("cache_detected_numa_node")) {
             int32_t numaNode = 0;
             dict.GetNumber("cache_detected_numa_node", numaNode);
@@ -194,6 +199,10 @@ struct Config {
         }
         if (localRankSize == 0) {
             return Status::InvalidParam("invalid local rank size({})", localRankSize);
+        }
+        if (cacheRank < -1 || (cacheRank >= 0 && static_cast<size_t>(cacheRank) >= localRankSize)) {
+            return Status::InvalidParam("invalid cache rank({}) for ranks({})", cacheRank,
+                                        localRankSize);
         }
         if (detectedNumaNode.has_value() && *detectedNumaNode < 0) {
             return Status::InvalidParam("invalid detected numa node({})", *detectedNumaNode);
